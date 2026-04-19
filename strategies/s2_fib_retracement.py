@@ -1,18 +1,7 @@
 # =============================================================================
-# S2 — Fibonacci Retracement Entry (LRHR — Low Risk High Reward)
-# =============================================================================
-# Rules (from VanIlango book):
-#   1. Identify trend via HH/HL (UP) or LH/LL (DOWN) on the day.
-#   2. Identify the most recent swing move (last swing low → swing high for UP;
-#      last swing high → swing low for DOWN).
-#   3. Calculate Fib retracement levels (38.2, 50, 61.8, 78.6).
-#   4. Long  : Price pulls back into 50%–61.8% Fib zone + bullish reversal candle
-#              (Close > Open) + price above 200 EMA → entry signal.
-#   5. Short : Price bounces into 50%–61.8% Fib zone + bearish reversal candle
-#              (Close < Open) + price below 200 EMA → entry signal.
-#   SL    : Long  → 78.6% Fib level (one step deeper)
-#            Short → 78.6% Fib level above
-#   Target: 0.0% Fib (prior swing high/low) = R:R ~2:1 naturally
+# S2 — Fibonacci Retracement Entry (LRHR)
+# FIX: Look-ahead bias removed — swings only used after SWING_LOOKBACK
+#      confirmation bars have passed (i.e. index <= i - SWING_LOOKBACK)
 # =============================================================================
 
 from __future__ import annotations
@@ -25,12 +14,12 @@ from indicators import (
     fib_retracement, fib_retracement_up,
 )
 
-SWING_LOOKBACK = 5
-EMA_PERIOD     = 200
-MIN_BARS       = 30
-FIB_ENTRY_LOW  = 0.50    # enter if price is between 50% and 61.8%
-FIB_ENTRY_HIGH = 0.618
-FIB_SL         = 0.786
+SWING_LOOKBACK  = 5
+EMA_PERIOD      = 200
+MIN_BARS        = 35
+FIB_ENTRY_LOW   = 0.50
+FIB_ENTRY_HIGH  = 0.618
+FIB_SL          = 0.786
 
 
 class S2FibRetracement:
@@ -55,31 +44,31 @@ class S2FibRetracement:
             if signal_fired_today:
                 break
 
-            sub_sh = df_day.loc[sh_mask & (df_day.index <= i), "High"].values
-            sub_sl = df_day.loc[sl_mask & (df_day.index <= i), "Low"].values
+            # ── LOOK-AHEAD FIX ──────────────────────────────────────────────
+            confirmed_by = i - SWING_LOOKBACK
+            sub_sh = df_day.loc[sh_mask & (df_day.index <= confirmed_by), "High"].values
+            sub_sl = df_day.loc[sl_mask & (df_day.index <= confirmed_by), "Low"].values
 
             if len(sub_sh) < 2 or len(sub_sl) < 2:
                 continue
 
-            trend     = classify_trend(list(sub_sh), list(sub_sl))
-            cur_close = close.iloc[i]
-            cur_open  = open_.iloc[i]
-            cur_ema   = ema200.iloc[i]
+            trend          = classify_trend(list(sub_sh), list(sub_sl))
+            cur_close      = close.iloc[i]
+            cur_open       = open_.iloc[i]
+            cur_ema        = ema200.iloc[i]
             bullish_candle = cur_close > cur_open
             bearish_candle = cur_close < cur_open
 
             if trend == "UP" and cur_close > cur_ema:
-                # Most recent swing move: last swing low → last swing high
                 swing_low  = sub_sl[-1]
                 swing_high = sub_sh[-1]
                 if swing_high <= swing_low:
                     continue
-                fibs = fib_retracement(swing_low, swing_high)
-                # Entry zone: price pulled back to 50%–61.8%
-                entry_zone_hi = fibs[FIB_ENTRY_LOW]
-                entry_zone_lo = fibs[FIB_ENTRY_HIGH]
-                sl_level      = fibs[FIB_SL]
-                target_level  = swing_high    # return to prior high
+                fibs         = fib_retracement(swing_low, swing_high)
+                entry_zone_hi= fibs[FIB_ENTRY_LOW]
+                entry_zone_lo= fibs[FIB_ENTRY_HIGH]
+                sl_level     = fibs[FIB_SL]
+                target_level = swing_high
 
                 if entry_zone_lo <= cur_close <= entry_zone_hi and bullish_candle:
                     risk = cur_close - sl_level
@@ -95,16 +84,15 @@ class S2FibRetracement:
                         signal_fired_today = True
 
             elif trend == "DOWN" and cur_close < cur_ema:
-                # Downtrend: bounce from recent low back toward prior high
                 swing_high = sub_sh[-1]
                 swing_low  = sub_sl[-1]
                 if swing_low >= swing_high:
                     continue
-                fibs = fib_retracement_up(swing_high, swing_low)
-                entry_zone_lo = fibs[FIB_ENTRY_LOW]
-                entry_zone_hi = fibs[FIB_ENTRY_HIGH]
-                sl_level      = fibs[FIB_SL]
-                target_level  = swing_low     # return to prior low
+                fibs         = fib_retracement_up(swing_high, swing_low)
+                entry_zone_lo= fibs[FIB_ENTRY_LOW]
+                entry_zone_hi= fibs[FIB_ENTRY_HIGH]
+                sl_level     = fibs[FIB_SL]
+                target_level = swing_low
 
                 if entry_zone_lo <= cur_close <= entry_zone_hi and bearish_candle:
                     risk = sl_level - cur_close
