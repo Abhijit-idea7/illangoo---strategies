@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # =============================================================================
 # run_backtest.py — Main CLI runner for Ilango Backtest Suite
-# Strategies: S1, S2, S3, S5, S6, S9  (S4 dropped — unprofitable)
+# Strategies: S1, S2, S3, S5 (1H SAR), S5b (15min SAR), S6, S9
 # =============================================================================
 # Usage:
-#   python run_backtest.py                          # all strategies, all symbols
-#   python run_backtest.py --strategy S2            # single strategy
-#   python run_backtest.py --symbols RELIANCE TCS   # specific symbols
-#   python run_backtest.py --strategy S2 --symbols INFY WIPRO
+#   python run_backtest.py                            # all strategies, all symbols
+#   python run_backtest.py --strategy S5 S5b          # compare SAR timeframes
+#   python run_backtest.py --symbols HDFCBANK TCS LT AXISBANK ICICIBANK
+#   python run_backtest.py --strategy S5 S5b --symbols HDFCBANK TCS LT AXISBANK ICICIBANK
 # =============================================================================
 
 import argparse
@@ -24,6 +24,9 @@ from strategies import ALL_STRATEGIES
 
 colorama_init(autoreset=True)
 
+# Stocks selected for S5 live trading
+SELECTED_5 = ["HDFCBANK", "TCS", "LT", "AXISBANK", "ICICIBANK"]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -31,10 +34,9 @@ colorama_init(autoreset=True)
 
 def banner():
     print(f"\n{Fore.CYAN}{'='*65}")
-    print(f"  Ilango / JustNifty — Intraday Strategy Backtest Suite v2")
+    print(f"  Ilango / JustNifty — Intraday Strategy Backtest Suite v3")
     print(f"  Capital : ₹{CAPITAL:,.0f}  |  Data: yFinance 2m (last 60d)")
-    print(f"  Fixes   : look-ahead bias removed | S5 SAR on full history")
-    print(f"            S9 RSI thresholds relaxed | S4 dropped")
+    print(f"  SAR variants: S5 = 1-Hour | S5b = 15-Minute")
     print(f"{'='*65}{Style.RESET_ALL}\n")
 
 
@@ -43,7 +45,8 @@ def run_strategy_on_symbol(strategy_cls, symbol: str, verbose: bool = True) -> d
     strat = strategy_cls()
 
     print(
-        f"  {Fore.YELLOW}[{strat.code}] {symbol}{Style.RESET_ALL} — fetching 2m data …",
+        f"  {Fore.YELLOW}[{strat.code}] {symbol}{Style.RESET_ALL}"
+        f" — fetching 2m data …",
         end=" ", flush=True,
     )
 
@@ -59,7 +62,7 @@ def run_strategy_on_symbol(strategy_cls, symbol: str, verbose: bool = True) -> d
 
     print(f"{Fore.GREEN}{len(df)} bars{Style.RESET_ALL}")
 
-    engine = BacktestEngine(strat, symbol, df)
+    engine  = BacktestEngine(strat, symbol, df)
     trades  = engine.run()
     metrics = compute_metrics(trades, CAPITAL)
 
@@ -99,7 +102,7 @@ def print_combined_table(all_results: dict):
         tablefmt="rounded_outline",
     ))
 
-    # Aggregate by strategy
+    # ── Strategy aggregate ───────────────────────────────────────────────
     by_strat = defaultdict(lambda: {"trades": 0, "pnl": 0.0, "wins": 0})
     for (sym, code), m in all_results.items():
         if m:
@@ -127,6 +130,31 @@ def print_combined_table(all_results: dict):
         tablefmt="rounded_outline",
     ))
 
+    # ── S5 vs S5b head-to-head (if both present) ────────────────────────
+    s5_codes = [c for c in by_strat if c in ("S5", "S5b")]
+    if len(s5_codes) == 2:
+        print(f"\n{Fore.CYAN}S5 (1-Hour) vs S5b (15-Min) — Head-to-Head:{Style.RESET_ALL}")
+        h2h = []
+        for code in ["S5", "S5b"]:
+            agg = by_strat[code]
+            t   = agg["trades"]
+            wr  = (agg["wins"] / t * 100) if t > 0 else 0
+            pct = agg["pnl"] / CAPITAL * 100
+            h2h.append([
+                code,
+                ALL_STRATEGIES[code].name,
+                t,
+                f"{wr:.1f}%",
+                f"₹{agg['pnl']:,.0f}",
+                f"{pct:.2f}%",
+                f"~{t // max(len([k for k in all_results if k[1]==code]), 1)} per stock",
+            ])
+        print(tabulate(
+            h2h,
+            headers=["Code", "Strategy", "Trades", "Win%", "Total P&L", "Return%", "Avg/Stock"],
+            tablefmt="rounded_outline",
+        ))
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -142,15 +170,21 @@ def main():
         "--symbols", "-sym", nargs="+", default=None,
         help="NSE symbols (no .NS suffix). Default: from config.py.",
     )
+    parser.add_argument(
+        "--selected", action="store_true",
+        help=f"Run on selected 5 stocks only: {SELECTED_5}",
+    )
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Suppress per-trade output.")
     args = parser.parse_args()
 
     banner()
 
-    # Determine strategies
+    # Strategies
     if args.strategy:
         codes = [c.upper() for c in args.strategy]
+        # handle S5B → S5b
+        codes = [c if c != "S5B" else "S5b" for c in codes]
         invalid = [c for c in codes if c not in ALL_STRATEGIES]
         if invalid:
             print(f"{Fore.RED}Unknown codes: {invalid}. Valid: {list(ALL_STRATEGIES.keys())}{Style.RESET_ALL}")
@@ -159,7 +193,13 @@ def main():
     else:
         strategies_to_run = ALL_STRATEGIES
 
-    symbols = args.symbols if args.symbols else SYMBOLS
+    # Symbols
+    if args.selected:
+        symbols = SELECTED_5
+    elif args.symbols:
+        symbols = args.symbols
+    else:
+        symbols = SYMBOLS
 
     print(f"  Strategies : {list(strategies_to_run.keys())}")
     print(f"  Symbols    : {symbols}")
