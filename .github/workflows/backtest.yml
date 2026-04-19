@@ -1,0 +1,58 @@
+name: Ilango Intraday Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: 'Strategy code: S1 S2 S3 S4 S5 S6 S9 (blank = ALL)'
+        required: false
+        default: ''
+      symbols:
+        description: 'NSE symbols space-separated (blank = use config.py list)'
+        required: false
+        default: ''
+
+  schedule:
+    - cron: '0 2 * * 1'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backtest (all strategies, all symbols)
+        if: ${{ github.event.inputs.strategy == '' && github.event.inputs.symbols == '' }}
+        run: python run_backtest.py --summary
+
+      - name: Run backtest (specific strategy/symbols)
+        if: ${{ github.event.inputs.strategy != '' || github.event.inputs.symbols != '' }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.strategy }}" ]; then
+            ARGS="$ARGS --strategy ${{ github.event.inputs.strategy }}"
+          fi
+          if [ -n "${{ github.event.inputs.symbols }}" ]; then
+            ARGS="$ARGS --symbols ${{ github.event.inputs.symbols }}"
+          fi
+          python run_backtest.py $ARGS --summary
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-reports-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
