@@ -6,11 +6,15 @@
 #   a list of Signal namedtuples. The engine iterates the day candle-by-candle,
 #   enters on signal, manages SL/Target, and force-exits at FORCE_EXIT_TIME.
 #
+# Special case — S5 (JNSAR):
+#   If the strategy has a `precompute(df_full)` method, it is called ONCE
+#   before the day loop so SAR can warm up on the full multi-day history.
+#
 # Trade lifecycle per day (intraday only — NO overnight positions):
-#   1. Scan for entry signal on each bar
-#   2. If signal: enter at next bar's Open (realistic fill)
-#   3. Check each subsequent bar for SL hit, Target hit, or time exit
-#   4. Record trade with all metadata
+#   1. Strategy generates signals for the day (using data up to bar i only)
+#   2. Signal fires at bar i → enter at bar i+1 Open (realistic fill)
+#   3. Manage SL / Target / Time-exit bar by bar
+#   4. Force-exit at FORCE_EXIT_TIME; EOD close if still open at last bar
 # =============================================================================
 
 from __future__ import annotations
@@ -18,8 +22,8 @@ from __future__ import annotations
 import os
 import json
 from collections import namedtuple
-from dataclasses import dataclass, field
-from datetime import datetime, time
+from dataclasses import dataclass
+from datetime import time
 from typing import List, Optional
 
 import numpy as np
@@ -42,11 +46,11 @@ from indicators import position_size
 Signal = namedtuple(
     "Signal",
     [
-        "bar_index",    # integer index in the day's DataFrame where signal fires
+        "bar_index",    # integer row position in the day's reset-indexed DataFrame
         "direction",    # "LONG" or "SHORT"
-        "entry_price",  # suggested entry price (often current Close)
+        "entry_price",  # reference entry price (used for risk calc only)
         "sl_price",     # stop-loss level
-        "target_price", # profit target (or None to trail)
+        "target_price", # profit target
         "strategy",     # strategy code string e.g. "S1"
     ],
 )
@@ -64,7 +68,7 @@ class Trade:
     qty: int
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
-    exit_reason: Optional[str] = None   # "TARGET", "SL", "TIME_EXIT", "EOD"
+    exit_reason: Optional[str] = None   # "TARGET" | "SL" | "TIME_EXIT" | "EOD"
     pnl: float = 0.0
     pnl_pct: float = 0.0
 
@@ -73,8 +77,8 @@ class Trade:
         return self.exit_time is None
 
     def close(self, exit_time, exit_price, reason):
-        self.exit_time  = exit_time
-        self.exit_price = exit_price
+        self.exit_time   = exit_time
+        self.exit_price  = exit_price
         self.exit_reason = reason
         if self.direction == "LONG":
             self.pnl = (exit_price - self.entry_price) * self.qty
@@ -92,7 +96,7 @@ class BacktestEngine:
         """
         strategy : strategy instance with generate_signals(df_day) method
         symbol   : NSE symbol string
-        df       : full OHLCV DataFrame (multi-day, IST index)
+        df       : full OHLCV DataFrame (multi-day, IST DatetimeIndex)
         """
         self.strategy = strategy
         self.symbol   = symbol
@@ -101,12 +105,17 @@ class BacktestEngine:
 
     def run(self) -> List[Trade]:
         """Run backtest day by day. Returns list of completed Trade objects."""
+
+        # ── Pre-compute for strategies that need full history (e.g. S5 JNSAR)
+        if hasattr(self.strategy, "precompute") and callable(self.strategy.precompute):
+            self.strategy.precompute(self.df)
+
         trading_days = sorted(self.df.index.normalize().unique())
 
         for day in trading_days:
             df_day = self.df[self.df.index.normalize() == day].copy()
-            df_day = df_day.reset_index(drop=False)  # keep timestamp column
-            # yFinance names the index "Datetime" — rename to "index" for consistency
+            df_day = df_day.reset_index(drop=False)
+            # yFinance names the index "Datetime" — normalise to "index"
             ts_col = df_day.columns[0]
             df_day = df_day.rename(columns={ts_col: "index"})
             if len(df_day) < 10:
@@ -115,14 +124,13 @@ class BacktestEngine:
 
         return self.trades
 
+    # ------------------------------------------------------------------
     def _run_day(self, df_day: pd.DataFrame, day):
         """Simulate a single trading day candle-by-candle."""
         trades_today = 0
         open_trade: Optional[Trade] = None
         force_exit_t = time(*[int(x) for x in FORCE_EXIT_TIME.split(":")])
 
-        # Let the strategy generate all signals for this day up-front
-        # (signals fired at bar i are entered at bar i+1 open)
         try:
             signals: List[Signal] = self.strategy.generate_signals(df_day)
         except Exception as e:
@@ -140,9 +148,9 @@ class BacktestEngine:
 
             current_time = ts.time() if hasattr(ts, "time") else ts
 
-            # ── Manage open trade ──────────────────────────────────────────
+            # ── Manage open trade ──────────────────────────────────────
             if open_trade is not None and open_trade.is_open:
-                # Force exit at FORCE_EXIT_TIME
+
                 if current_time >= force_exit_t:
                     open_trade.close(ts, close, "TIME_EXIT")
                     self.trades.append(open_trade)
@@ -150,66 +158,60 @@ class BacktestEngine:
                     continue
 
                 if open_trade.direction == "LONG":
-                    # Check SL hit (intra-bar Low)
                     if low <= open_trade.sl_price:
-                        exit_p = open_trade.sl_price
-                        open_trade.close(ts, exit_p, "SL")
+                        open_trade.close(ts, open_trade.sl_price, "SL")
                         self.trades.append(open_trade)
                         open_trade = None
-                    # Check Target hit
                     elif open_trade.target_price and high >= open_trade.target_price:
-                        exit_p = open_trade.target_price
-                        open_trade.close(ts, exit_p, "TARGET")
+                        open_trade.close(ts, open_trade.target_price, "TARGET")
                         self.trades.append(open_trade)
                         open_trade = None
                 else:  # SHORT
                     if high >= open_trade.sl_price:
-                        exit_p = open_trade.sl_price
-                        open_trade.close(ts, exit_p, "SL")
+                        open_trade.close(ts, open_trade.sl_price, "SL")
                         self.trades.append(open_trade)
                         open_trade = None
                     elif open_trade.target_price and low <= open_trade.target_price:
-                        exit_p = open_trade.target_price
-                        open_trade.close(ts, exit_p, "TARGET")
+                        open_trade.close(ts, open_trade.target_price, "TARGET")
                         self.trades.append(open_trade)
                         open_trade = None
 
-            # ── Check for new entry signal at bar i ────────────────────────
-            # Enter at the NEXT bar's open (i+1), so look ahead by 1
-            entry_bar = i - 1   # signals from bar i-1 enter at bar i open
+            # ── Check for new entry signal ─────────────────────────────
+            # Signal fires at bar (i-1); we enter at bar i's Open
+            entry_bar = i - 1
             if (
                 open_trade is None
                 and trades_today < MAX_TRADES_PER_DAY
                 and entry_bar in signal_map
                 and current_time < force_exit_t
             ):
-                sig = signal_map[entry_bar]
-                entry_price = open_  # fill at this bar's open
+                sig         = signal_map[entry_bar]
+                entry_price = open_   # realistic fill at next bar open
 
-                # Validate signal still makes sense at entry
-                if sig.direction == "LONG" and entry_price < sig.sl_price:
-                    pass  # price already below SL — skip
-                elif sig.direction == "SHORT" and entry_price > sig.sl_price:
-                    pass  # price already above SL — skip
-                else:
-                    qty = position_size(CAPITAL, RISK_PER_TRADE_PCT, entry_price, sig.sl_price)
-                    if qty > 0:
-                        open_trade = Trade(
-                            symbol       = self.symbol,
-                            strategy     = sig.strategy,
-                            direction    = sig.direction,
-                            entry_time   = ts,
-                            entry_price  = entry_price,
-                            sl_price     = sig.sl_price,
-                            target_price = sig.target_price,
-                            qty          = qty,
-                        )
-                        trades_today += 1
+                # Sanity check: don't enter if price has already blown past SL
+                if sig.direction == "LONG" and entry_price <= sig.sl_price:
+                    continue
+                if sig.direction == "SHORT" and entry_price >= sig.sl_price:
+                    continue
+
+                qty = position_size(CAPITAL, RISK_PER_TRADE_PCT, entry_price, sig.sl_price)
+                if qty > 0:
+                    open_trade = Trade(
+                        symbol       = self.symbol,
+                        strategy     = sig.strategy,
+                        direction    = sig.direction,
+                        entry_time   = ts,
+                        entry_price  = entry_price,
+                        sl_price     = sig.sl_price,
+                        target_price = sig.target_price,
+                        qty          = qty,
+                    )
+                    trades_today += 1
 
         # End of day — close any still-open trade at last bar's close
         if open_trade is not None and open_trade.is_open:
-            last_row = df_day.iloc[-1]
-            open_trade.close(last_row["index"], last_row["Close"], "EOD")
+            last = df_day.iloc[-1]
+            open_trade.close(last["index"], last["Close"], "EOD")
             self.trades.append(open_trade)
 
 
@@ -218,32 +220,29 @@ class BacktestEngine:
 # ---------------------------------------------------------------------------
 
 def compute_metrics(trades: List[Trade], capital: float = CAPITAL) -> dict:
-    """Compute standard backtest performance metrics from a list of trades."""
+    """Compute standard backtest performance metrics."""
     if not trades:
         return {"total_trades": 0}
 
-    pnls  = [t.pnl for t in trades]
-    wins  = [p for p in pnls if p > 0]
-    losses= [p for p in pnls if p <= 0]
+    pnls   = [t.pnl for t in trades]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
 
-    total_pnl    = sum(pnls)
-    win_rate     = len(wins) / len(pnls) * 100 if pnls else 0
-    avg_win      = np.mean(wins)  if wins   else 0
-    avg_loss     = np.mean(losses) if losses else 0
-    profit_factor= (sum(wins) / abs(sum(losses))) if losses else float("inf")
+    total_pnl     = sum(pnls)
+    win_rate      = len(wins) / len(pnls) * 100 if pnls else 0
+    avg_win       = np.mean(wins)   if wins   else 0
+    avg_loss      = np.mean(losses) if losses else 0
+    profit_factor = (sum(wins) / abs(sum(losses))) if losses else float("inf")
 
-    # Running equity for drawdown
     equity = np.cumsum([0] + pnls) + capital
     peak   = np.maximum.accumulate(equity)
     dd     = (equity - peak) / peak * 100
     max_dd = dd.min()
 
-    # Exit reason breakdown
     reasons = {}
     for t in trades:
         reasons[t.exit_reason] = reasons.get(t.exit_reason, 0) + 1
 
-    # Per-strategy breakdown
     strategies = {}
     for t in trades:
         if t.strategy not in strategies:
@@ -254,18 +253,18 @@ def compute_metrics(trades: List[Trade], capital: float = CAPITAL) -> dict:
             strategies[t.strategy]["wins"] += 1
 
     return {
-        "total_trades"  : len(trades),
-        "win_count"     : len(wins),
-        "loss_count"    : len(losses),
-        "win_rate_pct"  : round(win_rate, 2),
-        "total_pnl"     : round(total_pnl, 2),
-        "avg_win"       : round(avg_win, 2),
-        "avg_loss"      : round(avg_loss, 2),
-        "profit_factor" : round(profit_factor, 3),
+        "total_trades"    : len(trades),
+        "win_count"       : len(wins),
+        "loss_count"      : len(losses),
+        "win_rate_pct"    : round(win_rate, 2),
+        "total_pnl"       : round(total_pnl, 2),
+        "avg_win"         : round(avg_win, 2),
+        "avg_loss"        : round(avg_loss, 2),
+        "profit_factor"   : round(profit_factor, 3),
         "max_drawdown_pct": round(max_dd, 2),
-        "return_pct"    : round(total_pnl / capital * 100, 2),
-        "exit_reasons"  : reasons,
-        "by_strategy"   : strategies,
+        "return_pct"      : round(total_pnl / capital * 100, 2),
+        "exit_reasons"    : reasons,
+        "by_strategy"     : strategies,
     }
 
 
@@ -274,7 +273,7 @@ def compute_metrics(trades: List[Trade], capital: float = CAPITAL) -> dict:
 # ---------------------------------------------------------------------------
 
 def print_summary(symbol: str, metrics: dict, trades: List[Trade]):
-    """Pretty-print a strategy summary to console."""
+    """Pretty-print a summary to console."""
     print(f"\n{'='*60}")
     print(f"  Symbol : {symbol}")
     print(f"  Trades : {metrics.get('total_trades', 0)}")
@@ -296,13 +295,17 @@ def print_summary(symbol: str, metrics: dict, trades: List[Trade]):
                 t.exit_reason,
                 f"₹{t.pnl:,.0f}",
             ]
-            for t in trades[-10:]   # show last 10
+            for t in trades[-10:]
         ]
-        print(tabulate(rows, headers=["Entry", "Dir", "Entry₹", "Exit₹", "Reason", "PnL"], tablefmt="rounded_outline"))
+        print(tabulate(
+            rows,
+            headers=["Entry", "Dir", "Entry₹", "Exit₹", "Reason", "PnL"],
+            tablefmt="rounded_outline",
+        ))
 
 
 def save_report(symbol: str, strategy_code: str, metrics: dict, trades: List[Trade]):
-    """Save trade log and metrics to JSON in reports/ directory."""
+    """Save trade log and metrics to JSON."""
     os.makedirs(REPORTS_DIR, exist_ok=True)
     report = {
         "symbol"   : symbol,

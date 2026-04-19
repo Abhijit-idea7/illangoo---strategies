@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # =============================================================================
 # run_backtest.py — Main CLI runner for Ilango Backtest Suite
+# Strategies: S1, S2, S3, S5, S6, S9  (S4 dropped — unprofitable)
 # =============================================================================
 # Usage:
 #   python run_backtest.py                          # all strategies, all symbols
-#   python run_backtest.py --strategy S3            # single strategy
+#   python run_backtest.py --strategy S2            # single strategy
 #   python run_backtest.py --symbols RELIANCE TCS   # specific symbols
-#   python run_backtest.py --strategy S3 --symbols INFY WIPRO
-#   python run_backtest.py --summary                # print combined summary table
+#   python run_backtest.py --strategy S2 --symbols INFY WIPRO
 # =============================================================================
 
 import argparse
@@ -15,11 +15,10 @@ import sys
 import time
 from collections import defaultdict
 
-import pandas as pd
 from colorama import Fore, Style, init as colorama_init
 
-from config import SYMBOLS, RUN_STRATEGIES, CAPITAL, REPORTS_DIR
-from data_fetcher import fetch_ohlcv, fetch_hourly
+from config import SYMBOLS, CAPITAL, REPORTS_DIR
+from data_fetcher import fetch_ohlcv
 from backtest_engine import BacktestEngine, compute_metrics, print_summary, save_report
 from strategies import ALL_STRATEGIES
 
@@ -32,23 +31,24 @@ colorama_init(autoreset=True)
 
 def banner():
     print(f"\n{Fore.CYAN}{'='*65}")
-    print(f"  Ilango / JustNifty — Intraday Strategy Backtest Suite")
-    print(f"  Capital: ₹{CAPITAL:,.0f}  |  Data: yFinance 2m (last 60d)")
+    print(f"  Ilango / JustNifty — Intraday Strategy Backtest Suite v2")
+    print(f"  Capital : ₹{CAPITAL:,.0f}  |  Data: yFinance 2m (last 60d)")
+    print(f"  Fixes   : look-ahead bias removed | S5 SAR on full history")
+    print(f"            S9 RSI thresholds relaxed | S4 dropped")
     print(f"{'='*65}{Style.RESET_ALL}\n")
 
 
 def run_strategy_on_symbol(strategy_cls, symbol: str, verbose: bool = True) -> dict:
-    """Download data, run backtest, compute metrics, save report."""
+    """Download 2m data, run backtest, compute metrics, save report."""
     strat = strategy_cls()
-    is_hourly = strategy_cls.code == "S5"
 
-    print(f"  {Fore.YELLOW}[{strat.code}] {symbol}{Style.RESET_ALL} — fetching {'hourly' if is_hourly else '2m'} data …", end=" ", flush=True)
+    print(
+        f"  {Fore.YELLOW}[{strat.code}] {symbol}{Style.RESET_ALL} — fetching 2m data …",
+        end=" ", flush=True,
+    )
 
     try:
-        if is_hourly:
-            df = fetch_hourly(symbol)
-        else:
-            df = fetch_ohlcv(symbol)
+        df = fetch_ohlcv(symbol)
     except Exception as e:
         print(f"{Fore.RED}FAILED ({e}){Style.RESET_ALL}")
         return {}
@@ -60,7 +60,7 @@ def run_strategy_on_symbol(strategy_cls, symbol: str, verbose: bool = True) -> d
     print(f"{Fore.GREEN}{len(df)} bars{Style.RESET_ALL}")
 
     engine = BacktestEngine(strat, symbol, df)
-    trades = engine.run()
+    trades  = engine.run()
     metrics = compute_metrics(trades, CAPITAL)
 
     if verbose:
@@ -71,12 +71,12 @@ def run_strategy_on_symbol(strategy_cls, symbol: str, verbose: bool = True) -> d
 
 
 def print_combined_table(all_results: dict):
-    """Print a cross-symbol, cross-strategy summary table."""
+    """Print cross-symbol, cross-strategy summary sorted by Return%."""
     from tabulate import tabulate
 
     rows = []
     for (sym, code), m in all_results.items():
-        if not m:
+        if not m or m.get("total_trades", 0) == 0:
             continue
         rows.append([
             sym, code,
@@ -88,15 +88,14 @@ def print_combined_table(all_results: dict):
             f"{m.get('max_drawdown_pct', 0):.2f}%",
         ])
 
-    # Sort by return descending
     rows.sort(key=lambda r: float(r[5].rstrip("%")), reverse=True)
 
     print(f"\n{Fore.CYAN}{'='*65}")
-    print("  COMBINED RESULTS SUMMARY")
+    print("  COMBINED RESULTS (excluding zero-trade rows)")
     print(f"{'='*65}{Style.RESET_ALL}")
     print(tabulate(
         rows,
-        headers=["Symbol", "Strategy", "Trades", "Win%", "P&L", "Return%", "PF", "MaxDD%"],
+        headers=["Symbol", "Strat", "Trades", "Win%", "P&L", "Return%", "PF", "MaxDD%"],
         tablefmt="rounded_outline",
     ))
 
@@ -106,17 +105,27 @@ def print_combined_table(all_results: dict):
         if m:
             by_strat[code]["trades"] += m.get("total_trades", 0)
             by_strat[code]["pnl"]    += m.get("total_pnl", 0)
-            wins = m.get("win_count", 0)
-            by_strat[code]["wins"]   += wins
+            by_strat[code]["wins"]   += m.get("win_count", 0)
 
     strat_rows = []
-    for code, agg in sorted(by_strat.items()):
-        t = agg["trades"]
-        wr = (agg["wins"] / t * 100) if t > 0 else 0
-        strat_rows.append([code, ALL_STRATEGIES[code].name, t, f"{wr:.1f}%", f"₹{agg['pnl']:,.0f}"])
+    for code in sorted(by_strat):
+        agg = by_strat[code]
+        t   = agg["trades"]
+        wr  = (agg["wins"] / t * 100) if t > 0 else 0
+        strat_rows.append([
+            code,
+            ALL_STRATEGIES[code].name,
+            t,
+            f"{wr:.1f}%",
+            f"₹{agg['pnl']:,.0f}",
+        ])
 
     print(f"\n{Fore.CYAN}Strategy Aggregate:{Style.RESET_ALL}")
-    print(tabulate(strat_rows, headers=["Code", "Strategy", "Trades", "Win%", "Total P&L"], tablefmt="rounded_outline"))
+    print(tabulate(
+        strat_rows,
+        headers=["Code", "Strategy", "Trades", "Win%", "Total P&L"],
+        tablefmt="rounded_outline",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -125,32 +134,31 @@ def print_combined_table(all_results: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="Ilango Intraday Backtest Suite")
-    parser.add_argument("--strategy", "-s", nargs="+", default=None,
-                        help="Strategy code(s): S1 S2 S3 S4 S5 S6 S9. Default: all.")
-    parser.add_argument("--symbols", "-sym", nargs="+", default=None,
-                        help="NSE symbols (no .NS suffix). Default: from config.py.")
-    parser.add_argument("--summary", action="store_true",
-                        help="Print combined cross-strategy summary table at the end.")
+    parser.add_argument(
+        "--strategy", "-s", nargs="+", default=None,
+        help=f"Strategy codes: {list(ALL_STRATEGIES.keys())}. Default: all.",
+    )
+    parser.add_argument(
+        "--symbols", "-sym", nargs="+", default=None,
+        help="NSE symbols (no .NS suffix). Default: from config.py.",
+    )
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Suppress per-trade output.")
     args = parser.parse_args()
 
     banner()
 
-    # Determine which strategies to run
+    # Determine strategies
     if args.strategy:
         codes = [c.upper() for c in args.strategy]
         invalid = [c for c in codes if c not in ALL_STRATEGIES]
         if invalid:
-            print(f"{Fore.RED}Unknown strategy codes: {invalid}. Choose from {list(ALL_STRATEGIES.keys())}{Style.RESET_ALL}")
+            print(f"{Fore.RED}Unknown codes: {invalid}. Valid: {list(ALL_STRATEGIES.keys())}{Style.RESET_ALL}")
             sys.exit(1)
         strategies_to_run = {c: ALL_STRATEGIES[c] for c in codes}
-    elif RUN_STRATEGIES == "ALL":
-        strategies_to_run = ALL_STRATEGIES
     else:
-        strategies_to_run = {c: ALL_STRATEGIES[c] for c in RUN_STRATEGIES if c in ALL_STRATEGIES}
+        strategies_to_run = ALL_STRATEGIES
 
-    # Determine which symbols to run
     symbols = args.symbols if args.symbols else SYMBOLS
 
     print(f"  Strategies : {list(strategies_to_run.keys())}")
@@ -172,9 +180,7 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\n{Fore.GREEN}Backtest complete in {elapsed:.1f}s{Style.RESET_ALL}")
-
-    if args.summary or True:   # always show summary
-        print_combined_table(all_results)
+    print_combined_table(all_results)
 
 
 if __name__ == "__main__":
