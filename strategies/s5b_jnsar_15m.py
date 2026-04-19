@@ -117,8 +117,10 @@ class S5bJNSAR15m:
             sar_price  = flip["sar_price"]
             flip_close = flip["flip_close"]
 
-            # Find first 2m bar at or after the 15min flip bar
-            future_bars = df_day[df_day["index"] >= flip_time]
+            # Find first 2m bar at or after the 15min bar CLOSES
+            # (15min bar labeled T covers T → T+14min; it only closes at T+15min)
+            bar_end     = flip_time + pd.Timedelta(RESAMPLE_FREQ)
+            future_bars = df_day[df_day["index"] >= bar_end]
             if future_bars.empty:
                 continue
 

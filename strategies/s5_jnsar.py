@@ -14,8 +14,8 @@
 #   generate_signals(df_day):
 #     - df_day is the reset-indexed 2m DataFrame for one trading day
 #     - Look up any SAR flip that falls on this day
-#     - Find the first 2m bar at or after the flip hour → entry bar
-#     - Return Signal with that bar_index
+#     - Find the first 2m bar at or after flip_time + 1h (i.e. after bar closes)
+#     - Return Signal with that bar_index; engine fills at that bar+1 Open
 # =============================================================================
 
 from __future__ import annotations
@@ -123,8 +123,10 @@ class S5JNSAR:
             sar_price = flip["sar_price"]
             flip_close= flip["flip_close"]
 
-            # Find first 2m bar whose timestamp >= flip hour start
-            future_bars = df_day[df_day["index"] >= flip_time]
+            # Find first 2m bar whose timestamp >= flip hour END
+            # (1H bar labeled T covers T → T+59min; it only closes at T+1h)
+            bar_end     = flip_time + pd.Timedelta("1h")
+            future_bars = df_day[df_day["index"] >= bar_end]
             if future_bars.empty:
                 continue
 
