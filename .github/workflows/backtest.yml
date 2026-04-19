@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       strategy:
-        description: 'Strategy code: S1 S2 S3 S5 S6 S9 (blank = ALL)'
+        description: 'Strategy code(s): S1 S2 S3 S5 S5b S6 S9 (blank = ALL). S5=hourly SAR, S5b=15min SAR pullback'
         required: false
         default: ''
       symbols:
