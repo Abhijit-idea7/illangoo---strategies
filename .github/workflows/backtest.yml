@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       strategy:
-        description: 'Strategy code: S1 S2 S3 S4 S5 S6 S9 (blank = ALL)'
+        description: 'Strategy code: S1 S2 S3 S5 S6 S9 (blank = ALL)'
         required: false
         default: ''
       symbols:
@@ -36,7 +36,7 @@ jobs:
 
       - name: Run backtest (all strategies, all symbols)
         if: ${{ github.event.inputs.strategy == '' && github.event.inputs.symbols == '' }}
-        run: python run_backtest.py --summary
+        run: python run_backtest.py
 
       - name: Run backtest (specific strategy/symbols)
         if: ${{ github.event.inputs.strategy != '' || github.event.inputs.symbols != '' }}
@@ -48,7 +48,7 @@ jobs:
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
             ARGS="$ARGS --symbols ${{ github.event.inputs.symbols }}"
           fi
-          python run_backtest.py $ARGS --summary
+          python run_backtest.py $ARGS
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
