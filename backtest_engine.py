@@ -106,6 +106,9 @@ class BacktestEngine:
         for day in trading_days:
             df_day = self.df[self.df.index.normalize() == day].copy()
             df_day = df_day.reset_index(drop=False)  # keep timestamp column
+            # yFinance names the index "Datetime" — rename to "index" for consistency
+            ts_col = df_day.columns[0]
+            df_day = df_day.rename(columns={ts_col: "index"})
             if len(df_day) < 10:
                 continue
             self._run_day(df_day, day)
